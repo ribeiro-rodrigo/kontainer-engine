@@ -169,11 +169,11 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Type:  types.StringType,
 		Usage: "The displayed name of the cluster in the Rancher UI",
 	}
-	driverFlag.Options["access-key"] = &types.Flag{
+	driverFlag.Options["client-id"] = &types.Flag{
 		Type:  types.StringType,
 		Usage: "The AWS Client ID to use",
 	}
-	driverFlag.Options["secret-key"] = &types.Flag{
+	driverFlag.Options["client-secret"] = &types.Flag{
 		Type:     types.StringType,
 		Password: true,
 		Usage:    "The AWS Client Secret associated with the Client ID",
@@ -315,10 +315,15 @@ func (d *Driver) GetDriverUpdateOptions(ctx context.Context) (*types.DriverFlags
 		Usage: "A session token to use with the client key and secret if applicable.",
 	}
 
+	driverFlag.Options["desired-nodes"] = &types.Flag{
+		Type:  types.IntType,
+		Usage: "The desired number of worker nodes",
+	}
+
 	return &driverFlag, nil
 }
 
-func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
+func getStateFromOptions(driverOptions *types.DriverOptions, isUpdate bool) (state, error) {
 	state := state{}
 	state.ClusterName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "name").(string)
 	state.DisplayName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "display-name", "displayName").(string)
@@ -344,7 +349,11 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	// UserData
 	state.UserData = options.GetValueFromDriverOptions(driverOptions, types.StringType, "user-data", "userData").(string)
 
-	return state, state.validate()
+	if isUpdate{
+		return state, nil
+	}else{
+		return state, state.validate()
+	}
 }
 
 func (state *state) validate() error {
@@ -517,7 +526,7 @@ func toStringLiteralSlice(strings []*string) []string {
 func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *types.ClusterInfo) (*types.ClusterInfo, error) {
 	logrus.Infof("[amazonelasticcontainerservice] Starting create")
 
-	state, err := getStateFromOptions(options)
+	state, err := getStateFromOptions(options, false)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing state: %v", err)
 	}
@@ -687,32 +696,47 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		volumeSize = *state.NodeVolumeSize
 	}
 
+	/*securityGroupsString := strings.Join(toStringLiteralSlice(securityGroups), ",")
+	volumeSizeString := strconv.Itoa(int(volumeSize))
+	subnetIdsString := strings.Join(toStringLiteralSlice(securityGroups), ",")
+	publicIPString := strconv.FormatBool(publicIP)
+	ebsEncryptationString := strconv.FormatBool(state.EBSEncryption)*/
+
+	// these parameter values must exactly match those in the template file
+	params := []*cloudformation.Parameter{
+		{ParameterKey: aws.String("ClusterName"), ParameterValue: aws.String(state.DisplayName)},
+		{ParameterKey: aws.String("ClusterControlPlaneSecurityGroup"),
+			ParameterValue: aws.String(strings.Join(toStringLiteralSlice(securityGroups), ","))},
+		{ParameterKey: aws.String("NodeGroupName"),
+			ParameterValue: aws.String(state.DisplayName + "-node-group")},
+		{ParameterKey: aws.String("NodeAutoScalingGroupMinSize"), ParameterValue: aws.String(strconv.Itoa(
+			int(state.MinimumASGSize)))},
+		{ParameterKey: aws.String("NodeAutoScalingGroupMaxSize"), ParameterValue: aws.String(strconv.Itoa(
+			int(state.MaximumASGSize)))},
+		{ParameterKey: aws.String("NodeAutoScalingGroupDesiredCapacity"), ParameterValue: aws.String(strconv.Itoa(
+			int(state.DesiredASGSize)))},
+		{ParameterKey: aws.String("NodeVolumeSize"), ParameterValue: aws.String(strconv.Itoa(
+			int(volumeSize)))},
+		{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(state.InstanceType)},
+		{ParameterKey: aws.String("NodeImageId"), ParameterValue: aws.String(amiID)},
+		{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(keyPairName)},
+		{ParameterKey: aws.String("VpcId"), ParameterValue: aws.String(vpcid)},
+		{ParameterKey: aws.String("Subnets"),
+			ParameterValue: aws.String(strings.Join(toStringLiteralSlice(subnetIds), ","))},
+		{ParameterKey: aws.String("PublicIp"), ParameterValue: aws.String(strconv.FormatBool(publicIP))},
+		{ParameterKey: aws.String("EBSEncryption"), ParameterValue: aws.String(strconv.FormatBool(state.EBSEncryption))},
+	}
+
+	parametersBytes, err := json.Marshal(params)
+
+	if err != nil {
+		return nil, err
+	}
+
+	info.Metadata["parameters"] = string(parametersBytes)
+
 	stack, err := d.createStack(svc, getWorkNodeName(state.DisplayName), displayName, workerNodesFinalTemplate,
-		[]string{cloudformation.CapabilityCapabilityIam},
-		// these parameter values must exactly match those in the template file
-		[]*cloudformation.Parameter{
-			{ParameterKey: aws.String("ClusterName"), ParameterValue: aws.String(state.DisplayName)},
-			{ParameterKey: aws.String("ClusterControlPlaneSecurityGroup"),
-				ParameterValue: aws.String(strings.Join(toStringLiteralSlice(securityGroups), ","))},
-			{ParameterKey: aws.String("NodeGroupName"),
-				ParameterValue: aws.String(state.DisplayName + "-node-group")},
-			{ParameterKey: aws.String("NodeAutoScalingGroupMinSize"), ParameterValue: aws.String(strconv.Itoa(
-				int(state.MinimumASGSize)))},
-			{ParameterKey: aws.String("NodeAutoScalingGroupMaxSize"), ParameterValue: aws.String(strconv.Itoa(
-				int(state.MaximumASGSize)))},
-			{ParameterKey: aws.String("NodeAutoScalingGroupDesiredCapacity"), ParameterValue: aws.String(strconv.Itoa(
-				int(state.DesiredASGSize)))},
-			{ParameterKey: aws.String("NodeVolumeSize"), ParameterValue: aws.String(strconv.Itoa(
-				int(volumeSize)))},
-			{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(state.InstanceType)},
-			{ParameterKey: aws.String("NodeImageId"), ParameterValue: aws.String(amiID)},
-			{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(keyPairName)},
-			{ParameterKey: aws.String("VpcId"), ParameterValue: aws.String(vpcid)},
-			{ParameterKey: aws.String("Subnets"),
-				ParameterValue: aws.String(strings.Join(toStringLiteralSlice(subnetIds), ","))},
-			{ParameterKey: aws.String("PublicIp"), ParameterValue: aws.String(strconv.FormatBool(publicIP))},
-			{ParameterKey: aws.String("EBSEncryption"), ParameterValue: aws.String(strconv.FormatBool(state.EBSEncryption))},
-		})
+		[]string{cloudformation.CapabilityCapabilityIam}, params)
 	if err != nil {
 		return info, fmt.Errorf("error creating stack with worker nodes template: %v", err)
 	}
@@ -726,6 +750,12 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	if err != nil {
 		return info, err
 	}
+
+	/*info.Metadata["security-groups"] = securityGroupsString
+	info.Metadata["volume-size"] = volumeSizeString
+	info.Metadata["subnet-ids"] = subnetIdsString
+	info.Metadata["public-ip"] = publicIPString
+	info.Metadata["ebs-encryptation"] = ebsEncryptationString*/
 
 	return info, nil
 }
@@ -970,7 +1000,7 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, options *t
 	}
 	*oldstate = state
 
-	newState, err := getStateFromOptions(options)
+	newState, err := getStateFromOptions(options,true)
 	if err != nil {
 		return nil, err
 	}
@@ -987,6 +1017,14 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, options *t
 
 	if newState.ClientSecret != "" && newState.ClientSecret != state.ClientSecret {
 		state.ClientSecret = newState.ClientSecret
+	}
+
+	if newState.DesiredASGSize > 0 {
+		state.DesiredASGSize = newState.DesiredASGSize
+		errUpdateNodePool := d.updateNodePoolAndAwait(state, info)
+		if errUpdateNodePool != nil {
+			return nil, errUpdateNodePool
+		}
 	}
 
 	if !sendUpdate {
@@ -1289,6 +1327,87 @@ func (d *Driver) SetVersion(ctx context.Context, info *types.ClusterInfo, versio
 	return nil
 }
 
+func (d *Driver) updateNodePoolAndAwait(state state, info *types.ClusterInfo)error{
+
+	var params []*cloudformation.Parameter
+	errUnmarshal := json.Unmarshal([]byte(info.Metadata["parameters"]),&params)
+
+	if errUnmarshal != nil{
+		return errUnmarshal
+	}
+
+	desiredASGSize := strconv.Itoa(int(state.DesiredASGSize))
+
+	updateFields := map[string]string{
+		"NodeAutoScalingGroupMinSize": desiredASGSize,
+		"NodeAutoScalingGroupDesiredCapacity": desiredASGSize,
+		"NodeAutoScalingGroupMaxSize": desiredASGSize,
+	}
+
+	updateParams(params, updateFields)
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(state.Region),
+		Credentials: credentials.NewStaticCredentials(
+			state.ClientID,
+			state.ClientSecret,
+			state.SessionToken,
+		),
+	})
+	if err != nil {
+		return err
+	}
+
+	stackName := getWorkNodeName(state.DisplayName)
+	cloudFormationService := cloudformation.New(sess)
+
+	templateOutput, errGetTemplate := cloudFormationService.GetTemplate(&cloudformation.GetTemplateInput{
+		StackName: aws.String(stackName),
+	})
+
+	if errGetTemplate != nil {
+		return err
+	}
+
+	updateInput := &cloudformation.UpdateStackInput{
+		Capabilities: []*string{aws.String(cloudformation.CapabilityCapabilityIam)},
+		StackName: aws.String(stackName),
+		TemplateBody: templateOutput.TemplateBody,
+		Parameters: params,
+	}
+
+	_, errUpdate := cloudFormationService.UpdateStack(updateInput)
+
+	if errUpdate != nil {
+		return errUpdate
+	}
+
+	stackStatus := "UPDATE_IN_PROGRESS"
+
+	for stackStatus == "UPDATE_IN_PROGRESS" || stackStatus == "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS" {
+		time.Sleep(2*time.Second)
+		describeOut, errDescribe := cloudFormationService.DescribeStacks(&cloudformation.DescribeStacksInput{
+			StackName: aws.String(stackName),
+		})
+
+		if errDescribe != nil {
+			return errDescribe
+		}
+
+		if len(describeOut.Stacks) == 0 {
+			return fmt.Errorf("stack did not have output")
+		}
+
+		stackStatus = *describeOut.Stacks[0].StackStatus
+	}
+
+	if stackStatus != "UPDATE_COMPLETE"{
+		return fmt.Errorf("error in update nodepool stack: %s",stackStatus)
+	}
+
+	return nil
+}
+
 func (d *Driver) updateClusterAndWait(ctx context.Context, state state) error {
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String(state.Region),
@@ -1381,6 +1500,15 @@ func (d *Driver) waitForClusterUpdateReady(ctx context.Context, svc *eks.EKS, st
 	}
 
 	return nil
+}
+
+func updateParams(params []*cloudformation.Parameter, fieldValues map[string]string){
+	for _,param := range params{
+		value, found := fieldValues[*param.ParameterKey]
+		if found {
+			*param.ParameterValue = value
+		}
+	}
 }
 
 func getAMIs(ctx context.Context, ec2svc *ec2.EC2, state state) string {
